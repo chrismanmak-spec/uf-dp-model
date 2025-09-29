@@ -1,2 +1,223 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# dp_uf_core.py
+# The Main Solver: Orchestrates the coupling between QFTCS (large scale) and Hydro (local)
+
+import numpy as np
+import time
+import os
+import matplotlib.pyplot as plt
+
+from params import *
+from qftcs_uf import compute_Tmunu
+from hydro_dp import init_dp_uf_fields, evolve_dp_uf_em_rad, dx
+
+def setup_visualization():
+    """Creates the output directory for storing image frames."""
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+    print(f"Saving visualization frames to '{OUTPUT_DIR}/'")
+
+def save_frame(step, rho, u, cosmo_bg):
+    """Saves a matplotlib plot of the current simulation state."""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    im1 = ax1.imshow(rho.T, origin='lower', cmap='viridis', extent=[0, L, 0, L])
+    ax1.set_title(f"DP Density ($\\rho_{{dp}}$)")
+    ax1.set_xlabel("x")
+    ax1.set_ylabel("y")
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+    im2 = ax2.imshow(u.T, origin='lower', cmap='inferno', extent=[0, L, 0, L])
+    ax2.set_title(f"UF Scalar Wave (u)")
+    ax2.set_xlabel("x")
+    ax2.set_ylabel("y")
+    fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+    
+    a_val = cosmo_bg['a']
+    adot_val = cosmo_bg['adot']
+    fig.suptitle(f'Step: {step} | Scale Factor a(t) = {a_val:.4f} | Expansion Rate $\\dot{{a}}(t)$ = {adot_val:.4f}', fontsize=16)
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(os.path.join(OUTPUT_DIR, f"frame_{step:05d}.png"))
+    plt.close(fig)
+
+def main_dp_uf_loop():
+    
+    print("Initializing GUT-UF/DP Coupled Simulation...")
+    # 1. Initialize all fields and visualization
+    (rho, vx, vy, u, u_prev, ut, tau, Ex, Ey, Bz, E_rad, Fx, Fy) = init_dp_uf_fields(Nx, Ny, L)
+    setup_visualization()
+
+    # 2. Initialize QFTCS background and state
+    cosmo_bg = {'a': 1.0, 'adot': H0, 'addot': 0.0, 'm': m_default, 'xi': xi_default}
+    qftcs_state = {'type': 'vacuum'}
+    qftcs_kparams = {'kmax': kmax_default, 'Nk': Nk_default}
+    
+    start_time = time.time()
+    
+    for step in range(nsteps):
+        
+        # -----------------------------------------------------
+        # A. QFTCS: Calculate UF quantum energy <T^munu_uf> (Global Source)
+        # -----------------------------------------------------
+        qftcs_res = compute_Tmunu(
+            cosmo_bg, state_params=qftcs_state, kparams=qftcs_kparams, 
+            renorm_order=4, dt_evolve=0.0, n_steps=0
+        )
+        rho_uf_qftcs = qftcs_res['rho'] 
+        P_uf_qftcs = qftcs_res['P']
+
+        # -----------------------------------------------------
+        # B. HYDRO: Evolve Local Fields (Local Dynamics)
+        # -----------------------------------------------------
+        (rho, vx, vy, u, u_prev, ut, tau, Ex, Ey, Bz, E_rad, Fx, Fy) = evolve_dp_uf_em_rad(
+            dt, 
+            rho, vx, vy, u, u_prev, ut, tau, Ex, Ey, Bz, E_rad, Fx, Fy,
+            rho_uf_qftcs 
+        )
+        
+        # -----------------------------------------------------
+        # C. FEEDBACK: Update Global Background (Live EFE Solver)
+        # -----------------------------------------------------
+        avg_rho_dp = np.mean(rho)
+        # Approximate average pressure of the dp fluid
+        avg_p_dp = np.mean(cs**2 * rho + A_ex * Excess * rho**n_exp)
+        
+        rho_total = avg_rho_dp + rho_uf_qftcs
+        P_total = avg_p_dp + P_uf_qftcs
+        
+        # The Friedmann acceleration equation: a_ddot/a = -4*pi*G/3 * (rho + 3P)
+        if cosmo_bg['a'] > 1e-6:
+             cosmo_bg['addot'] = (-4.0 * np.pi * G_NEWTON / 3.0) * (rho_total + 3.0 * P_total) * cosmo_bg['a']
+             cosmo_bg['addot'] -= FRIEDMANN_DAMPING * cosmo_bg['adot'] # Add damping for stability
+        
+        # Evolve the scale factor and its rate of change
+        cosmo_bg['adot'] += cosmo_bg['addot'] * dt
+        cosmo_bg['a'] += cosmo_bg['adot'] * dt
+
+        # -----------------------------------------------------
+        
+        if step % VIS_FRAMERATE == 0:
+            mass = np.sum(rho)*dx*dx
+            print(f"step {step:5d} | Mass={mass:.4f} | QFTCS_Rho_uf={rho_uf_qftcs:.4e} | a(t)={cosmo_bg['a']:.4f}")
+            save_frame(step, rho, u, cosmo_bg)
+            
+    print(f"\nSimulation complete in {time.time() - start_time:.2f} seconds.")
+    
+    # -----------------------------------------------------
+    # D. Print README for GitHub
+    # -----------------------------------------------------
+    print_readme_for_github()
+
+def print_readme_for_github():
+    readme_text = f"""
+================================================================================
+          GUT-UF/DP: A Grand Unified Theory Conceptualization
+================================================================================
+By Mark D. Chrisman
+
+## Overview
+
+This repository contains the source code for GUT-UF/DP, a computational framework
+designed to explore a conceptual Grand Unified Theory. The model bridges the gap
+between General Relativity and the Standard Model's quantum sectors through a
+novel **uf/dp (ultralight field / dense plasma) paradigm**.
+
+The core of this simulation is a dynamic coupling between two scales:
+1.  **Global Background (uf):** A quantum ultralight field whose vacuum energy
+    drives the cosmological expansion of the simulated universe, governed by
+    Quantum Field Theory in Curved Spacetime (QFTCS).
+2.  **Local Dynamics (dp):** A 2D grid simulating a dense plasma coupled with
+    electromagnetism and radiation, representing the localized matter and energy
+    that influences the spacetime curvature.
+
+## Development
+This framework was developed by leveraging the advanced information processing
+and strategic coding capabilities of three distinct AI platforms:
+- **Google Gemini:** For architectural design and complex physics integration.
+- **GitHub Copilot:** For accelerating code implementation and function generation.
+- **DuckDuckGo AI Chat:** For alternative algorithmic strategies and debugging.
+
+The unique development process involved a synthesis of outputs, with the user
+juggling concepts and code across these three powerful AI assistants to refine
+and progress the model.
+
+## To Run
+1. Ensure you have python and pip installed.
+2. Install dependencies: `pip install numpy matplotlib`
+3. Execute the main driver: `python dp_uf_core.py`
+4. Check the '{OUTPUT_DIR}/' directory for visualization frames.
+"""
+    print(readme_text)
+    # Optionally, save this to a file
+    with open("README.md", "w") as f:
+        f.write(readme_text)
+    print("\nREADME.md file has been generated.")
+
+
+if __name__ == "__main__":
+    main_dp_uf_loop()
+    git commit -m "Initial commit: GUT-UF/DP simulation framework"# 1. This renames your main branch to 'main', which is the standard
+git branch -M main
+
+# 2. This links your local repository to the remote one on GitHub
+#    (Replace YOUR_USERNAME with your actual GitHub username)
+git remote add origin https://github.com/YOUR_USERNAME/GUT-UF-DP.git
+
+# 3. This pushes your committed files to GitHub
+git push -u origin main# params.py
+# Unified configuration for the dp/uf coupled solver
+
+# --- Visualization & I/O ---
+VIS_FRAMERATE = 50           # Save a plot every N steps
+OUTPUT_DIR = "simulation_frames" # Directory to save frames
+
+# --- Mock EFE Solver Parameters ---
+G_NEWTON = 6.674e-2  # Mock gravitational constant (tweak for effect)
+H0 = 0.1             # Mock Hubble parameter for initial expansion
+FRIEDMANN_DAMPING = 0.01 # A small damping term for stability
+
+# --- Numerical Grid Parameters ---
+Nx = 128
+Ny = 128
+L = 1.0
+dx = L / Nx
+dt = 0.1 * dx  # Reduced dt for stability with new physics
+nsteps = 1000
+
+# --- QFTCS / UF Field Parameters ---
+m_default = 0.0      # field mass
+xi_default = 0.0     # curvature coupling
+mu_ren = 1.0         # renormalization scale for logs (EFT)
+kmax_default = 200.0 # max k for mode sum
+Nk_default = 1000    # number of k points
+tol_change = 1e-3    # change threshold for QFTCS reporter
+cuf = 1.0            # uf wave speed
+kappa_uf = 1.0       # coupling uf <- sources
+gamma_uf = 0.02      # uf damping/friction
+
+# --- DP Hydro / EM / Radiation Parameters ---
+c = 10.0             # light speed (must be >> cuf)
+epsilon0 = 1.0
+mu0 = 1.0 / epsilon0
+gamma_em = 0.001     # EM damping
+eps_emiss = 0.1      # Radiation emissivity
+kappa0 = 1.0         # Radiation opacity prefactor
+q_charge = 0.0       # Charge factor
+alpha = 0.5          # Term for pressure contribution in uf source
+
+# --- DP Fluid / Transfer (S) Parameters ---
+cs = 0.1             # sound speed
+A_ex = 0.5           # Excess amplitude factor
+n_exp = 1.5          # Density exponent
+Excess = 0.8         # Initial dp Surplus proxy
+eta_S = 0.02         # S transfer rate prefactor
+rho0 = 1.0
+rho_c = 0.3          # Critical density for S transfer
+drho = 0.05
+tau0 = 1.0           # Initial uf tension proxy
+lambda_tau = 0.05    # tau relaxation rate
+
+beta_tau = 0.5       # tau change with S transfer
+tauscale = 0.2       # tau exponential damping scale
